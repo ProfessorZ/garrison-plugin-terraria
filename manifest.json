@@ -1,0 +1,8 @@
+{
+  "name": "garrison-plugin-terraria",
+  "version": "1.0.0",
+  "game_type": "terraria",
+  "display_name": "Terraria",
+  "author": "ProfessorZ",
+  "description": "Terraria TShock plugin for Garrison"
+}
