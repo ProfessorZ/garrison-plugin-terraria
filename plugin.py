@@ -6,42 +6,10 @@ Token is obtained via POST /v2/token/create and included in subsequent requests.
 """
 
 import aiohttp
+import json
 from typing import Optional
 
-try:
-    from app.plugins.base import GamePlugin, PlayerInfo
-except ImportError:
-    # Standalone / testing fallback
-    from dataclasses import dataclass, field
-    from typing import List
-
-    @dataclass
-    class PlayerInfo:
-        name: str
-        steam_id: str = ""
-        ping: int = 0
-        score: int = 0
-
-    class GamePlugin:
-        custom_connection = False
-
-        async def connect_custom(self, host, port, password):
-            raise NotImplementedError
-
-        async def disconnect(self):
-            pass
-
-        async def get_players(self, send_command):
-            raise NotImplementedError
-
-        async def kick_player(self, send_command, name, reason=""):
-            raise NotImplementedError
-
-        async def ban_player(self, send_command, name, reason=""):
-            raise NotImplementedError
-
-        async def get_status(self, send_command):
-            raise NotImplementedError
+from app.plugins.base import GamePlugin, PlayerInfo, ServerStatus, CommandDef
 
 
 class TerrariaPlugin(GamePlugin):
@@ -53,6 +21,50 @@ class TerrariaPlugin(GamePlugin):
         self._token: Optional[str] = None
         self._base_url: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
+
+    @property
+    def game_type(self) -> str:
+        return "terraria"
+
+    @property
+    def display_name(self) -> str:
+        return "Terraria"
+
+    async def parse_players(self, raw_response: str) -> list[PlayerInfo]:
+        """Parse TShock /v2/players/list JSON response."""
+        try:
+            data = json.loads(raw_response) if isinstance(raw_response, str) else raw_response
+            players = []
+            for p in data.get("players", []):
+                name = p if isinstance(p, str) else p.get("nickname", p.get("name", ""))
+                players.append(PlayerInfo(name=name))
+            return players
+        except Exception:
+            return []
+
+    async def get_status(self, send_command) -> ServerStatus:
+        """Return server status."""
+        try:
+            data = await self._get("/v2/server/status")
+            return ServerStatus(
+                online=True,
+                player_count=data.get("playercount", 0),
+                version=data.get("serverversion"),
+                extra={
+                    "name": data.get("name", ""),
+                    "world": data.get("world", ""),
+                    "maxplayers": data.get("maxplayers", 0),
+                },
+            )
+        except Exception:
+            return ServerStatus(online=False)
+
+    def get_commands(self) -> list[CommandDef]:
+        try:
+            from schema import get_commands
+            return get_commands()
+        except ImportError:
+            return []
 
     async def connect_custom(self, host: str, port: int, password: str) -> bool:
         """Authenticate with TShock REST API and obtain a session token."""
@@ -84,7 +96,7 @@ class TerrariaPlugin(GamePlugin):
                 await self._session.close()
             raise
 
-    async def disconnect(self):
+    async def disconnect(self) -> None:
         """Close the aiohttp session."""
         if self._session and not self._session.closed:
             await self._session.close()
@@ -107,23 +119,17 @@ class TerrariaPlugin(GamePlugin):
         ) as resp:
             return await resp.json(content_type=None)
 
-    async def get_players(self, send_command) -> list:
+    async def get_players(self, send_command) -> list[PlayerInfo]:
         """Return list of online players."""
         data = await self._get("/v2/players/list")
-
-        players = []
-        for p in data.get("players", []):
-            name = p if isinstance(p, str) else p.get("nickname", p.get("name", ""))
-            players.append(PlayerInfo(name=name))
-
-        return players
+        raw = json.dumps(data)
+        return await self.parse_players(raw)
 
     async def kick_player(self, send_command, name: str, reason: str = "") -> bool:
         """Kick a player by name."""
         params = {"player": name}
         if reason:
             params["reason"] = reason
-
         data = await self._get("/v2/players/kick", **params)
         return data.get("status") == "200"
 
@@ -132,24 +138,8 @@ class TerrariaPlugin(GamePlugin):
         params = {"player": name}
         if reason:
             params["reason"] = reason
-
         data = await self._get("/v2/bans/create", **params)
         return data.get("status") == "200"
-
-    async def get_status(self, send_command) -> dict:
-        """Return server status info."""
-        data = await self._get("/v2/server/status")
-
-        return {
-            "name": data.get("name", ""),
-            "port": data.get("port"),
-            "player_count": data.get("playercount", 0),
-            "max_players": data.get("maxplayers", 0),
-            "world": data.get("world", ""),
-            "uptime": data.get("uptime", ""),
-            "tshock_version": data.get("serverversion", ""),
-            "raw": data,
-        }
 
     async def run_command(self, send_command, command: str) -> str:
         """Execute a raw TShock server command."""
