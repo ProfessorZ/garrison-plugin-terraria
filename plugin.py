@@ -6,14 +6,12 @@ Token is obtained via POST /v2/token/create and included in subsequent requests.
 """
 
 import aiohttp
-from typing import Optional
+from typing import Optional, List
 
 try:
     from app.plugins.base import GamePlugin, PlayerInfo
 except ImportError:
-    # Standalone / testing fallback
     from dataclasses import dataclass, field
-    from typing import List
 
     @dataclass
     class PlayerInfo:
@@ -28,8 +26,11 @@ except ImportError:
         async def connect_custom(self, host, port, password):
             raise NotImplementedError
 
-        async def disconnect(self):
+        async def disconnect_custom(self):
             pass
+
+        async def send_command_custom(self, command, content):
+            raise NotImplementedError
 
         async def get_players(self, send_command):
             raise NotImplementedError
@@ -54,6 +55,8 @@ class TerrariaPlugin(GamePlugin):
         self._base_url: Optional[str] = None
         self._session: Optional[aiohttp.ClientSession] = None
 
+    # ── Connection lifecycle ──────────────────────────────────────────────────
+
     async def connect_custom(self, host: str, port: int, password: str) -> bool:
         """Authenticate with TShock REST API and obtain a session token."""
         self._base_url = f"http://{host}:{port}"
@@ -62,7 +65,6 @@ class TerrariaPlugin(GamePlugin):
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=10)
             )
-
             async with self._session.post(
                 f"{self._base_url}/v2/token/create",
                 data={"password": password},
@@ -84,7 +86,7 @@ class TerrariaPlugin(GamePlugin):
                 await self._session.close()
             raise
 
-    async def disconnect(self):
+    async def disconnect_custom(self):
         """Close the aiohttp session."""
         if self._session and not self._session.closed:
             await self._session.close()
@@ -92,54 +94,41 @@ class TerrariaPlugin(GamePlugin):
         self._base_url = None
         self._session = None
 
+    # Keep backward-compat alias
+    async def disconnect(self):
+        await self.disconnect_custom()
+
+    # ── Low-level helpers ─────────────────────────────────────────────────────
+
     def _params(self, **extra) -> dict:
-        """Build query params with token."""
         return {"token": self._token, **extra}
 
     async def _get(self, path: str, **params):
-        """Make an authenticated GET request."""
         if not self._session or self._session.closed:
             raise ConnectionError("Not connected to TShock")
-
         async with self._session.get(
             f"{self._base_url}{path}",
             params=self._params(**params),
         ) as resp:
             return await resp.json(content_type=None)
 
-    async def get_players(self, send_command) -> list:
-        """Return list of online players."""
-        data = await self._get("/v2/players/list")
+    async def send_command_custom(self, command: str, content: str = "") -> str:
+        """
+        Execute a raw TShock server command via /v3/server/rawcmd.
+        `command` is the full command string (e.g. "say Hello world").
+        `content` is appended if non-empty.
+        """
+        cmd = f"{command} {content}".strip() if content else command
+        data = await self._get("/v3/server/rawcmd", cmd=cmd)
+        output = data.get("response", "")
+        if isinstance(output, list):
+            output = "\n".join(output)
+        return output
 
-        players = []
-        for p in data.get("players", []):
-            name = p if isinstance(p, str) else p.get("nickname", p.get("name", ""))
-            players.append(PlayerInfo(name=name))
-
-        return players
-
-    async def kick_player(self, send_command, name: str, reason: str = "") -> bool:
-        """Kick a player by name."""
-        params = {"player": name}
-        if reason:
-            params["reason"] = reason
-
-        data = await self._get("/v2/players/kick", **params)
-        return data.get("status") == "200"
-
-    async def ban_player(self, send_command, name: str, reason: str = "") -> bool:
-        """Ban a player by name."""
-        params = {"player": name}
-        if reason:
-            params["reason"] = reason
-
-        data = await self._get("/v2/bans/create", **params)
-        return data.get("status") == "200"
+    # ── Status & players ──────────────────────────────────────────────────────
 
     async def get_status(self, send_command) -> dict:
-        """Return server status info."""
         data = await self._get("/v2/server/status")
-
         return {
             "name": data.get("name", ""),
             "port": data.get("port"),
@@ -151,10 +140,127 @@ class TerrariaPlugin(GamePlugin):
             "raw": data,
         }
 
+    def parse_players(self, raw_response) -> List[PlayerInfo]:
+        """
+        Parse TShock /v2/players/list response into PlayerInfo list.
+        Response may be the full JSON dict or the players array directly.
+        """
+        if isinstance(raw_response, dict):
+            players_data = raw_response.get("players", [])
+        elif isinstance(raw_response, list):
+            players_data = raw_response
+        else:
+            return []
+
+        result = []
+        for p in players_data:
+            if isinstance(p, str):
+                result.append(PlayerInfo(name=p))
+            elif isinstance(p, dict):
+                name = p.get("nickname") or p.get("name", "")
+                result.append(PlayerInfo(
+                    name=name,
+                    steam_id=str(p.get("account", "")),
+                    ping=p.get("ping", 0),
+                ))
+        return result
+
+    async def get_players(self, send_command) -> List[PlayerInfo]:
+        data = await self._get("/v2/players/list")
+        return self.parse_players(data)
+
+    # ── Moderation ────────────────────────────────────────────────────────────
+
+    async def kick_player(self, send_command, name: str, reason: str = "") -> bool:
+        params = {"player": name}
+        if reason:
+            params["reason"] = reason
+        data = await self._get("/v2/players/kick", **params)
+        return data.get("status") == "200"
+
+    async def ban_player(self, send_command, name: str, reason: str = "") -> bool:
+        params = {"player": name}
+        if reason:
+            params["reason"] = reason
+        data = await self._get("/v2/bans/create", **params)
+        return data.get("status") == "200"
+
+    async def mute_player(self, send_command, name: str) -> bool:
+        data = await self._get("/v2/players/mute", player=name)
+        return data.get("status") == "200"
+
+    async def unmute_player(self, send_command, name: str) -> bool:
+        data = await self._get("/v2/players/unmute", player=name)
+        return data.get("status") == "200"
+
+    async def message_player(self, send_command, name: str, message: str) -> bool:
+        """Send a private message to a player using the whisper command."""
+        cmd = f"whisper {name} {message}"
+        data = await self._get("/v3/server/rawcmd", cmd=cmd)
+        return data.get("status") == "200"
+
+    # ── Roles / groups ────────────────────────────────────────────────────────
+
+    def get_player_roles(self) -> List[str]:
+        """TShock built-in group hierarchy."""
+        return ["owner", "superadmin", "admin", "moderator", "trusted", "default"]
+
+    async def promote_player(self, send_command, player: str, role: str) -> bool:
+        """Change a player's TShock group."""
+        data = await self._get("/v2/users/updategroup", user=player, group=role)
+        return data.get("status") == "200"
+
+    async def demote_player(self, send_command, player: str) -> bool:
+        """Reset a player's group to default."""
+        return await self.promote_player(send_command, player, "default")
+
+    # ── World ─────────────────────────────────────────────────────────────────
+
+    async def get_world(self, send_command) -> dict:
+        data = await self._get("/v2/world/read")
+        return {
+            "name": data.get("name", ""),
+            "size": data.get("size", ""),
+            "difficulty": data.get("difficulty", ""),
+            "is_hardmode": data.get("isHardmode", False),
+            "evil_type": data.get("evilType", ""),
+            "raw": data,
+        }
+
+    # ── Bans ──────────────────────────────────────────────────────────────────
+
+    async def get_bans(self, send_command) -> list:
+        data = await self._get("/v2/bans/list")
+        return data.get("bans", [])
+
+    async def unban_player(self, send_command, identifier: str) -> bool:
+        data = await self._get("/v2/bans/destroy", ban=identifier)
+        return data.get("status") == "200"
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    async def poll_events(self, send_command, since=None) -> list:
+        """
+        TShock REST API has no event stream endpoint.
+        Returns empty list; event polling is not supported.
+        """
+        return []
+
+    # ── Commands schema ───────────────────────────────────────────────────────
+
+    def get_commands(self) -> list:
+        """Return available commands from schema."""
+        try:
+            from . import schema
+        except ImportError:
+            try:
+                import schema  # type: ignore
+            except ImportError:
+                return []
+        return getattr(schema, "COMMANDS", [])
+
+    # ── Misc helpers ──────────────────────────────────────────────────────────
+
     async def run_command(self, send_command, command: str) -> str:
-        """Execute a raw TShock server command."""
-        data = await self._get("/v3/server/rawcmd", cmd=command)
-        output = data.get("response", "")
-        if isinstance(output, list):
-            output = "\n".join(output)
-        return output
+        """Execute a raw server command and return text output."""
+        return await self.send_command_custom(command)
