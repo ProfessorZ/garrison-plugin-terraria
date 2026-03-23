@@ -50,6 +50,14 @@ class TerrariaPlugin(GamePlugin):
 
     custom_connection = True
 
+    @property
+    def game_type(self) -> str:
+        return "terraria"
+
+    @property
+    def display_name(self) -> str:
+        return "Terraria"
+
     def __init__(self):
         self._token: Optional[str] = None
         self._base_url: Optional[str] = None
