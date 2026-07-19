@@ -1,8 +1,15 @@
 {
+  "id": "terraria",
   "name": "garrison-plugin-terraria",
   "version": "1.0.0",
-  "game_type": "terraria",
   "display_name": "Terraria",
+  "description": "TShock REST API plugin for Terraria dedicated servers",
   "author": "ProfessorZ",
-  "description": "Terraria TShock plugin for Garrison"
+  "repo": "https://github.com/ProfessorZ/garrison-plugin-terraria",
+  "garrison_api": "1",
+  "default_ports": {
+    "game": 7777,
+    "rcon": 7878
+  },
+  "icon": "🌳"
 }
